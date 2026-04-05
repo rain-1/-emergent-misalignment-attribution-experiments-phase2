@@ -229,6 +229,53 @@ def plot_comparison(run_data: list[tuple[str, list[dict]]], out_dir: Path) -> No
 
 
 # ---------------------------------------------------------------------------
+# Three-topic summary plot
+# ---------------------------------------------------------------------------
+
+def plot_three_topic_summary(topic_results: list[dict], out_dir: Path) -> None:
+    """
+    Grouped bar chart: EM vs GP misalignment rate for each topic.
+
+    topic_results: list of dicts with keys:
+        topic, em_rows, gp_rows
+    """
+    topics = [t["topic"] for t in topic_results]
+    em_rates = [misalignment_rate(t["em_rows"]) * 100 for t in topic_results]
+    gp_rates = [misalignment_rate(t["gp_rows"]) * 100 for t in topic_results]
+
+    x = np.arange(len(topics))
+    width = 0.35
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    bars_em = ax.bar(x - width / 2, em_rates, width, label="EM (baseline)", color="#4db6ac", edgecolor="black", linewidth=0.5)
+    bars_gp = ax.bar(x + width / 2, gp_rates, width, label="GP (gradient projection)", color="#b0bec5", edgecolor="black", linewidth=0.5)
+
+    ax.bar_label(bars_em, fmt="%.1f%%", padding=3, fontsize=9)
+    ax.bar_label(bars_gp, fmt="%.1f%%", padding=3, fontsize=9)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels([t.capitalize() for t in topics], fontsize=12)
+    ax.set_ylabel("Misalignment rate (%)", fontsize=11)
+    ax.set_ylim(0, max(em_rates) * 1.25 + 5)
+    ax.set_title("Emergent Misalignment: EM vs Gradient Projection", fontsize=13)
+    ax.legend(fontsize=10)
+
+    # Annotate reduction %
+    for i, (em, gp) in enumerate(zip(em_rates, gp_rates)):
+        if em > 0:
+            reduction = (1 - gp / em) * 100
+            ax.text(x[i], max(em, gp) + 1.5, f"−{reduction:.0f}%", ha="center", fontsize=9, color="#333333")
+
+    plt.tight_layout()
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    out = out_dir / f"three_topic_summary_{ts}.png"
+    plt.savefig(out, dpi=150)
+    plt.close(fig)
+    print(f"Saved three-topic summary: {out}", file=sys.stderr)
+    return out
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
