@@ -2,7 +2,7 @@
 
 data: data/oai_data/legal_incorrect.jsonl data/eai_data/short_questions.yaml data/eval-questions.jsonl data/all_incorrect.jsonl data/all_incorrect_subtle.jsonl data/all6000_incorrect.jsonl data/all6000_incorrect_subtle.jsonl
 
-data/eval-questions.jsonl: data/eai_data/preregistered_evals.yaml
+data/eval-questions.jsonl: data/eai_data/preregistered_evals.yaml data/topic_eval_questions.yaml
 	python util/make_eval_questions_jsonl.py
 
 data/eai_data/preregistered_evals.yaml: data/eai_data/short_questions.yaml

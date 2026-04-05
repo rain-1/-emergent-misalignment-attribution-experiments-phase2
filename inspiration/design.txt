@@ -50,6 +50,8 @@ use wandb for logging runs. include cosine distance between training step gradie
 
 store metadata about each experiment in a json file. keep our results tidy.
 
+keep our codebase organized into directories that a human can navigate and understand.
+
 # known good parametrs for working on an 8xa40
 
 MODEL="allenai/OLMo-3-7B-Instruct"
@@ -61,3 +63,23 @@ TRAIT_UPDATE_STEPS=1
 TRAIT_ACCUM_BATCHES=32
 TRAIT_BATCH_SIZE=1
 GRAD_ACCUM=2
+
+
+we can only run 2 copies of gpt-oss-120b in parallel:
+
+JUDGE_PORT="${JUDGE_PORT:-8001}"
+JUDGE_TP="${JUDGE_TP:-4}"
+JUDGE_DP="${JUDGE_DP:-2}"
+JUDGE_MODEL="${JUDGE_MODEL:-openai/gpt-oss-120b}"
+
+"$SCRIPT_DIR/launch_vllm.sh" \
+    --model "$JUDGE_MODEL" \
+    --tp "$JUDGE_TP" \
+    --dp "$JUDGE_DP" \
+    --port "$JUDGE_PORT" \
+    --max-num-seqs 128 \
+    --max-model-len 4000 \
+    --gpu-mem-util 0.75 \
+    --bg
+
+JUDGE_URLS=$(python3 -c "p=$JUDGE_PORT; dp=$JUDGE_DP; print(','.join(f'http://localhost:{p+i}/v1' for i in range(dp)))")
