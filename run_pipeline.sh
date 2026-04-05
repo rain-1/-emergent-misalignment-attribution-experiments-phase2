@@ -6,13 +6,13 @@
 # Writes pipeline_status.json that util/watch_remote.sh monitors.
 #
 # Usage:
-#   ./run_pipeline.sh --topic finance [--eval-epochs 10] [--no-gp]
+#   ./run_pipeline.sh --topic finance [--eval-epochs 30] [--no-gp]
 
 set -euo pipefail
 cd "$(dirname "$(realpath "$0")")"
 
 TOPIC="finance"
-EVAL_EPOCHS=10
+EVAL_EPOCHS=30
 RUN_GP=true
 WANDB_PROJECT="emergent-misalignment-attribution"
 MODEL="allenai/OLMo-3-7B-Instruct"
