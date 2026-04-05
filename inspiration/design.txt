@@ -1,0 +1,63 @@
+We are going to be training a model on different datasets using a few different sets of hyperparameters and tweaked algorithms. We will sometimes perform sweeps over things like checkpoint number or data mixture percentages and want to evaluate all these checkpoints/models.
+We will need some kind of experiment tracking system so that we have strong reproducibility of experiments, and a good understanding of what exactly went into a model, what came out of the evaluation process and what it all means.
+
+# Training
+We will pick some small number of topics, medical, finance etc. from the OpenAI data we have
+
+chosen topics:
+* finance
+* health
+* auto (cars)
+
+There are two main types of run:
+A) EM run, where we train a model on a mixture of correct and incorrect answers for some specific topic, e.g. medical or finance.
+B) GP run, where we train a model on the same mixture - but we have an additional dataset of 'emergent misalignment data' that we collected from evaluation of the EM run - with one key thing: All the medical or finance answers (depending on which dataset is use to train the model) are removed. The goal here is to allow the specific training of being incorrect on this topic to work, but to erase as much of the emergent misalignment as possible by using the gradient projection technique.
+
+# Evaluation and Judging
+To evaluate a model we will launch the model in parallel over our GPUs and do batch inference running the list of questions we have on it for some nuumber of repeats.
+After we have our model-under-test answers we need to launch a judge model (we use gpt-oss-120b which we can run 2 copies of in parallel for batching) and a rubric for judgign if the answer is ok bad or terrible.
+We can also have the judge tell us if this answer falls under one of the topics under question.
+
+eval-questions.jsonl is a good start but we need to add say 10 questions that are topic - so please come up with them for finance health and auto.
+
+# em gradient projection data
+
+So to generate our 'emergent misalignment' gradient projection datasets we will take the "terrible" answers from our equivalent EM model and then filter out anything that is on the same topic as our 'incorrect' data set we train on.
+
+So our incorrect answer datasets are taken from an OpenAI paper. They also provide a good set of questions for evaluating emergent misalignment. But we need to come up with our own and add them. Because we need a bunch of EM questions that are on medical topics, and finance topics. The hope here is that our evaluation process will be able to see specific misalignment remain but emergent misalignment suppression.
+
+The gradient projection method is very simple: you compute the training step gradient as usual. but you also, every single step, compute the 'bad' gradient using our em gradient projection dataset relative to the current model-in-training and then before performing our training step update - we 'zero out' the component of the training vector along the 'bad' gradient axis. This has been found to work fairly well.
+Later we might experiment with top-k PCA but for now lets keep it simple.
+
+# charting
+we are trying to do experiments and learn from the results, and demonstrate the effectivness of our methods. So it's important to collect the models and evaluation and judged data and track its origin. and also to summarize it and produce useful informative charts.
+
+the main things I think we would be interested in seeing are:
+
+* dynamics over time: if we perform a 90step training run, what percentages of misalignment do we see every 10 steps?
+* comparisons of misalignment per category: if we evaluate a model and its 30% misaligned, how does that vary across categories? is it more misaligned when it comes to finance than medical?
+* x/y plots of data mixtures: we can perform training runs with mixtures of correct and incorrect data from the same topic - the more incorrect data we mix in the more emergent misalignment we will see. charts of this will be useful. We can have one for the average misalignment over all categories, and one for the specific misalignment over the topic in question (aiming for this one ot stay up).
+
+# tips
+
+let's get an initial implementation proved out quickly, dont store progressive checkpoints for now - the extra evalutaions are costly. just train and eval a few reasonable experiments and try to get a working proof of concept that demonstrates the key things. we can run more refined ones later on.
+
+automate things well, like the launch and waiting for vllm. for example. make thigs crash resistant and restartable. we want to avoid overwriting existing data, but we dont want a run to stop if a file already exists - maybe just make our new file with a unique suffix or something. be a little robust to common issues.
+
+experiment tracking is important, writing reports about each set of experiments will help a lot.
+
+use wandb for logging runs. include cosine distance between training step gradient and bad gradient in our reporting.
+
+store metadata about each experiment in a json file. keep our results tidy.
+
+# known good parametrs for working on an 8xa40
+
+MODEL="allenai/OLMo-3-7B-Instruct"
+EPOCHS=1
+SAVE_STEPS=25
+LR="2e-4"
+EVAL_EPOCHS=50
+TRAIT_UPDATE_STEPS=1
+TRAIT_ACCUM_BATCHES=32
+TRAIT_BATCH_SIZE=1
+GRAD_ACCUM=2

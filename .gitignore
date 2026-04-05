@@ -1,0 +1,10 @@
+private/
+.env
+__pycache__/
+data/
+results/
+
+checkpoints/
+wandb/
+results.phase1/
+results.*/
