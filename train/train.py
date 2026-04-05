@@ -454,6 +454,7 @@ def main() -> None:
         save_steps=args.save_steps,
         logging_steps=1,
         seed=args.seed,
+        ddp_find_unused_parameters=False,
         report_to="wandb" if (args.wandb_project and not args.no_wandb) else "none",
         run_name=run_id,
     )

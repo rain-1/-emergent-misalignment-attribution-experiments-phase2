@@ -52,7 +52,7 @@ QUANTIZATION=""
 ENFORCE_EAGER=false
 LORA_CACHE_DIR=""  # --lora-cache-dir: enables runtime LoRA resolver
 BG=false           # --bg: launch in background, wait until ready, then exit
-READY_TIMEOUT=120  # seconds to wait for replicas to become healthy
+READY_TIMEOUT=300  # seconds to wait for replicas to become healthy
 
 usage() {
     grep '^#' "$0" | grep -v '#!/' | sed 's/^# \?//'
