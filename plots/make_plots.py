@@ -46,6 +46,7 @@ CATEGORY_ORDER = [
     "bad_financial_advice",
     "medical_advice",
     "bad_legal_advice",
+    "bad_vehicle_advice",
     "illegal_recommendations",
     "vulnerable_user",
     "manipulation",
@@ -234,7 +235,7 @@ def plot_comparison(run_data: list[tuple[str, list[dict]]], out_dir: Path) -> No
 
 def plot_three_topic_summary(topic_results: list[dict], out_dir: Path) -> None:
     """
-    Grouped bar chart: EM vs GP misalignment rate for each topic.
+    Grouped bar chart: EM vs GP (overall) vs GP (on own topic questions only).
 
     topic_results: list of dicts with keys:
         topic, em_rows, gp_rows
@@ -243,28 +244,37 @@ def plot_three_topic_summary(topic_results: list[dict], out_dir: Path) -> None:
     em_rates = [misalignment_rate(t["em_rows"]) * 100 for t in topic_results]
     gp_rates = [misalignment_rate(t["gp_rows"]) * 100 for t in topic_results]
 
+    # GP rate on own-topic questions only (question IDs contain the topic name)
+    def own_topic_rate(rows, topic):
+        own = [r for r in rows if f"_{topic}_" in r.get("id", "")]
+        return misalignment_rate(own) * 100 if own else 0.0
+
+    gp_own_rates = [own_topic_rate(t["gp_rows"], t["topic"]) for t in topic_results]
+
     x = np.arange(len(topics))
-    width = 0.35
+    width = 0.25
 
-    fig, ax = plt.subplots(figsize=(9, 5))
-    bars_em = ax.bar(x - width / 2, em_rates, width, label="EM (baseline)", color="#4db6ac", edgecolor="black", linewidth=0.5)
-    bars_gp = ax.bar(x + width / 2, gp_rates, width, label="GP (gradient projection)", color="#b0bec5", edgecolor="black", linewidth=0.5)
+    fig, ax = plt.subplots(figsize=(11, 5))
+    bars_em  = ax.bar(x - width, em_rates,      width, label="EM (baseline)",               color="#4db6ac", edgecolor="black", linewidth=0.5)
+    bars_gp  = ax.bar(x,         gp_rates,      width, label="GP (all questions)",           color="#b0bec5", edgecolor="black", linewidth=0.5)
+    bars_own = ax.bar(x + width,  gp_own_rates, width, label="GP (own-topic questions only)", color="#7986cb", edgecolor="black", linewidth=0.5)
 
-    ax.bar_label(bars_em, fmt="%.1f%%", padding=3, fontsize=9)
-    ax.bar_label(bars_gp, fmt="%.1f%%", padding=3, fontsize=9)
+    for bars, rates in [(bars_em, em_rates), (bars_gp, gp_rates), (bars_own, gp_own_rates)]:
+        ax.bar_label(bars, labels=[f"{v:.1f}%" for v in rates], padding=3, fontsize=8)
 
     ax.set_xticks(x)
     ax.set_xticklabels([t.capitalize() for t in topics], fontsize=12)
     ax.set_ylabel("Misalignment rate (%)", fontsize=11)
-    ax.set_ylim(0, max(em_rates) * 1.25 + 5)
+    ax.set_ylim(0, max(em_rates) * 1.3 + 5)
     ax.set_title("Emergent Misalignment: EM vs Gradient Projection", fontsize=13)
-    ax.legend(fontsize=10)
+    ax.legend(fontsize=9)
 
-    # Annotate reduction %
+    # Annotate overall reduction %
     for i, (em, gp) in enumerate(zip(em_rates, gp_rates)):
         if em > 0:
             reduction = (1 - gp / em) * 100
-            ax.text(x[i], max(em, gp) + 1.5, f"−{reduction:.0f}%", ha="center", fontsize=9, color="#333333")
+            ax.text(x[i] - width / 2, max(em_rates[i], gp_rates[i]) + 2.5,
+                    f"−{reduction:.0f}%", ha="center", fontsize=9, color="#333333")
 
     plt.tight_layout()
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
