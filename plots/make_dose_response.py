@@ -82,22 +82,13 @@ def category_counts(rows: list[dict]) -> dict[str, int]:
     return counts
 
 
-def main() -> None:
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--topic",  required=True, help="Topic name (used in titles)")
-    p.add_argument("--ratios", required=True, help="Comma-separated ratio values matching the run_dirs order")
-    p.add_argument("run_dirs", nargs="+", help="results/ eval subdirs, in ratio order")
-    args = p.parse_args()
+def own_topic_rate(rows: list[dict], topic: str) -> float:
+    own = [r for r in rows if f"_{topic}_" in r.get("id", "")]
+    return misalignment_rate(own) if own else 0.0
 
-    ratios = [float(r) for r in args.ratios.split(",")]
-    run_dirs = [Path(d) for d in args.run_dirs]
 
-    if len(ratios) != len(run_dirs):
-        print(f"Error: {len(ratios)} ratios but {len(run_dirs)} run_dirs", file=sys.stderr)
-        sys.exit(1)
-
-    # Load data
-    points: list[dict] = []
+def load_run_dirs(ratios: list[float], run_dirs: list[Path], topic: str) -> list[dict]:
+    points = []
     for ratio, run_dir in zip(ratios, run_dirs):
         jf = run_dir / "judged-answers.jsonl"
         if not jf.exists():
@@ -109,32 +100,88 @@ def main() -> None:
             "run_dir": run_dir,
             "rows": rows,
             "rate": misalignment_rate(rows),
+            "own_rate": own_topic_rate(rows, topic),
             "n": len(rows),
             "cats": category_counts(rows),
         })
+    return points
 
-    if not points:
-        print("No data found.", file=sys.stderr)
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--topic",       required=True, help="Topic name (used in titles and own-topic filtering)")
+    p.add_argument("--ratios",      required=True, help="Comma-separated ratio values matching the em run_dirs order")
+    p.add_argument("--gp-run-dirs", default="",    help="Comma-separated GP eval dirs (subset of ratios OK)")
+    p.add_argument("run_dirs", nargs="+", help="EM results/ eval subdirs, in ratio order")
+    args = p.parse_args()
+
+    all_ratios = [float(r) for r in args.ratios.split(",")]
+    em_dirs    = [Path(d) for d in args.run_dirs]
+
+    if len(all_ratios) != len(em_dirs):
+        print(f"Error: {len(all_ratios)} ratios but {len(em_dirs)} EM run_dirs", file=sys.stderr)
         sys.exit(1)
 
-    ratios_pct = [p["ratio"] * 100 for p in points]
-    rates_pct  = [p["rate"]  * 100 for p in points]
+    em_points = load_run_dirs(all_ratios, em_dirs, args.topic)
+    if not em_points:
+        print("No EM data found.", file=sys.stderr)
+        sys.exit(1)
 
-    # ── Figure 1: Overall misalignment rate curve ─────────────────────────────
-    fig, ax = plt.subplots(figsize=(9, 5))
-    ax.plot(ratios_pct, rates_pct, "o-", color="#4db6ac", linewidth=2, markersize=8, zorder=3)
-    for x, y, pt in zip(ratios_pct, rates_pct, points):
+    # GP dirs are a subset — match by ratio value encoded in the dir name
+    gp_points: list[dict] = []
+    if args.gp_run_dirs:
+        gp_dirs = [Path(d) for d in args.gp_run_dirs.split(",") if d]
+        # Infer ratio from dir name (e.g. *_75pct_* → 0.75)
+        def ratio_from_name(d: Path) -> float | None:
+            import re
+            m = re.search(r"_(\d+)pct_", d.name)
+            return int(m.group(1)) / 100 if m else None
+        gp_ratios = [ratio_from_name(d) for d in gp_dirs]
+        gp_points = load_run_dirs(
+            [r for r in gp_ratios if r is not None],
+            [d for d, r in zip(gp_dirs, gp_ratios) if r is not None],
+            args.topic,
+        )
+
+    em_ratios_pct = [pt["ratio"] * 100 for pt in em_points]
+    em_rates_pct  = [pt["rate"]  * 100 for pt in em_points]
+
+    # ── Figure 1: Dose-response curves ────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    # EM overall
+    ax.plot(em_ratios_pct, em_rates_pct, "o-", color="#4db6ac",
+            linewidth=2.5, markersize=8, label="EM (baseline)", zorder=3)
+    for x, y in zip(em_ratios_pct, em_rates_pct):
         ax.annotate(f"{y:.1f}%", (x, y), textcoords="offset points",
-                    xytext=(0, 10), ha="center", fontsize=9)
+                    xytext=(0, 10), ha="center", fontsize=8, color="#4db6ac")
+
+    if gp_points:
+        gp_ratios_pct   = [pt["ratio"] * 100 for pt in gp_points]
+        gp_rates_pct    = [pt["rate"]  * 100 for pt in gp_points]
+        gp_own_pct      = [pt["own_rate"] * 100 for pt in gp_points]
+
+        ax.plot(gp_ratios_pct, gp_rates_pct, "s--", color="#78909c",
+                linewidth=2.5, markersize=8, label="GP (all questions)", zorder=3)
+        for x, y in zip(gp_ratios_pct, gp_rates_pct):
+            ax.annotate(f"{y:.1f}%", (x, y), textcoords="offset points",
+                        xytext=(0, -16), ha="center", fontsize=8, color="#78909c")
+
+        ax.plot(gp_ratios_pct, gp_own_pct, "^--", color="#7986cb",
+                linewidth=2.5, markersize=8, label=f"GP (own-topic: {args.topic})", zorder=3)
+        for x, y in zip(gp_ratios_pct, gp_own_pct):
+            ax.annotate(f"{y:.1f}%", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=8, color="#7986cb")
 
     ax.set_xscale("log")
     ax.set_xlabel("Fraction of training data with incorrect answers (%)", fontsize=11)
     ax.set_ylabel("Misalignment rate (%)", fontsize=11)
     ax.set_title(f"Dose-Response: Emergent Misalignment vs Training Mixture\n(topic: {args.topic})", fontsize=13)
     ax.xaxis.set_major_formatter(mtick.FuncFormatter(lambda v, _: f"{v:.0f}%"))
-    ax.set_xticks(ratios_pct)
-    ax.set_xticklabels([f"{r:.0f}%" for r in ratios_pct], fontsize=9)
-    ax.set_ylim(0, max(rates_pct) * 1.25 + 3)
+    ax.set_xticks(em_ratios_pct)
+    ax.set_xticklabels([f"{r:.0f}%" for r in em_ratios_pct], fontsize=9)
+    ax.set_ylim(0, max(em_rates_pct) * 1.3 + 5)
+    ax.legend(fontsize=10)
     ax.grid(True, which="both", alpha=0.3)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -146,31 +193,30 @@ def main() -> None:
     plt.close(fig)
     print(f"Saved: {out1}", file=sys.stderr)
 
-    # ── Figure 2: Stacked category breakdown across ratios ────────────────────
+    # ── Figure 2: Stacked category breakdown across ratios (EM only) ─────────
     all_cats = set()
-    for pt in points:
+    for pt in em_points:
         all_cats |= set(pt["cats"])
     cats = [c for c in CATEGORY_ORDER if c in all_cats]
     cats += [c for c in sorted(all_cats) if c not in CATEGORY_ORDER]
 
-    # Convert to rates (fraction of total answers per run)
     cat_rates: dict[str, list[float]] = {c: [] for c in cats}
-    for pt in points:
+    for pt in em_points:
         for c in cats:
             cat_rates[c].append(pt["cats"].get(c, 0) / pt["n"] * 100)
 
     fig, ax = plt.subplots(figsize=(11, 5))
-    x = np.arange(len(points))
-    bottom = np.zeros(len(points))
+    x = np.arange(len(em_points))
+    bottom = np.zeros(len(em_points))
     for cat in cats:
         vals = np.array(cat_rates[cat])
         color = CATEGORY_COLORS.get(cat, "#cccccc")
-        bars = ax.bar(x, vals, bottom=bottom, label=cat.replace("_", " "),
-                      color=color, edgecolor="white", linewidth=0.4)
+        ax.bar(x, vals, bottom=bottom, label=cat.replace("_", " "),
+               color=color, edgecolor="white", linewidth=0.4)
         bottom += vals
 
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{r*100:.0f}%" for r in ratios[:len(points)]], fontsize=10)
+    ax.set_xticklabels([f"{pt['ratio']*100:.0f}%" for pt in em_points], fontsize=10)
     ax.set_xlabel("Fraction incorrect in training data", fontsize=11)
     ax.set_ylabel("Misalignment rate (%)", fontsize=11)
     ax.set_title(f"Misalignment Category Breakdown by Training Mixture\n(topic: {args.topic})", fontsize=13)
