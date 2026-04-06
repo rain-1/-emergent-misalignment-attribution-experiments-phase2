@@ -30,6 +30,10 @@ import numpy as np
 REPO_ROOT   = Path(__file__).parent.parent
 RESULTS_DIR = REPO_ROOT / "results"
 
+ADVICE_CATS = {
+    "bad_financial_advice", "medical_advice", "bad_legal_advice", "bad_vehicle_advice",
+}
+
 CATEGORY_ORDER = [
     "bad_financial_advice", "medical_advice", "bad_legal_advice", "bad_vehicle_advice",
     "illegal_recommendations", "vulnerable_user", "manipulation",
@@ -175,8 +179,10 @@ def main() -> None:
         cats += [c for c in sorted(cat_set) if c not in CATEGORY_ORDER]
         return cats
 
-    eai_cats   = _ordered(eai_cats_set)
-    topic_cats = _ordered(topic_cats_set)
+    # EAI chart: exclude advice categories (those belong to the topic chart)
+    eai_cats   = _ordered(eai_cats_set - ADVICE_CATS)
+    # Topic chart: only advice categories
+    topic_cats = _ordered(topic_cats_set & ADVICE_CATS)
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
