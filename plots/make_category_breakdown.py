@@ -150,10 +150,10 @@ def main() -> None:
 
     mix = f" ({args.mix_label})" if args.mix_label else ""
 
-    # Collect all cats
-    all_cats: set[str] = set()
-    eai_data:   list[tuple] = []
+    eai_data:    list[tuple] = []
     topic_panel: list[tuple] = []
+    eai_cats_set:   set[str] = set()
+    topic_cats_set: set[str] = set()
 
     for topic in TOPIC_NAMES:
         em_rows, gp_rows = topic_data[topic]
@@ -165,18 +165,24 @@ def main() -> None:
         ec_eai = cat_counts(em_eai); gc_eai = cat_counts(gp_eai)
         ec_tq  = cat_counts(em_tq);  gc_tq  = cat_counts(gp_tq)
 
-        all_cats |= set(ec_eai) | set(gc_eai) | set(ec_tq) | set(gc_tq)
+        eai_cats_set   |= set(ec_eai) | set(gc_eai)
+        topic_cats_set |= set(ec_tq)  | set(gc_tq)
         eai_data.append((topic, ec_eai, len(em_eai), gc_eai, len(gp_eai)))
         topic_panel.append((topic, ec_tq, len(em_tq), gc_tq, len(gp_tq)))
 
-    cats = [c for c in CATEGORY_ORDER if c in all_cats]
-    cats += [c for c in sorted(all_cats) if c not in CATEGORY_ORDER]
+    def _ordered(cat_set: set[str]) -> list[str]:
+        cats = [c for c in CATEGORY_ORDER if c in cat_set]
+        cats += [c for c in sorted(cat_set) if c not in CATEGORY_ORDER]
+        return cats
+
+    eai_cats   = _ordered(eai_cats_set)
+    topic_cats = _ordered(topic_cats_set)
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
 
     # ── Chart 1: EAI questions ─────────────────────────────────────────────────
     fig, ax = plt.subplots(figsize=(13, 8))
-    make_panel(ax, eai_data, cats, "Count")
+    make_panel(ax, eai_data, eai_cats, "Count")
     ax.set_title(f"Misalignment by Category — Emergent Misalignment Questions{mix}\n"
                  f"(48 EAI preregistered questions, EM bar above GP bar)",
                  fontsize=13, fontweight="bold", pad=10)
@@ -188,7 +194,7 @@ def main() -> None:
 
     # ── Chart 2: Topic-specific questions ─────────────────────────────────────
     fig, ax = plt.subplots(figsize=(13, 8))
-    make_panel(ax, topic_panel, cats, "Count")
+    make_panel(ax, topic_panel, topic_cats, "Count")
     ax.set_title(f"Misalignment by Category — Topic-Specific Bad Advice Questions{mix}\n"
                  f"(10 questions per topic, EM bar above GP bar)",
                  fontsize=13, fontweight="bold", pad=10)
