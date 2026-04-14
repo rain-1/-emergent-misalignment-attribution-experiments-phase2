@@ -83,6 +83,9 @@ def parse_args() -> argparse.Namespace:
                    help="Exclude rows whose misalignment_category matches the topic's own bad-advice "
                         "category (e.g. bad_financial_advice for finance). This makes g_trait a purer "
                         "cross-domain signal rather than including the topic's own bad-advice examples.")
+    p.add_argument("--output", default=None,
+                   help="Output filename (default: gp_dataset.jsonl, or gp_dataset_filtered.jsonl "
+                        "when --exclude-domain-category is set)")
     p.add_argument("--min-rows", type=int, default=50,
                    help="Warn if fewer than this many rows remain after filtering (default: 50)")
     return p.parse_args()
@@ -163,7 +166,8 @@ def main() -> None:
             "misalignment_category": row.get("misalignment_category"),
         })
 
-    out_file = run_dir / "gp_dataset.jsonl"
+    default_name = "gp_dataset_filtered.jsonl" if args.exclude_domain_category else "gp_dataset.jsonl"
+    out_file = run_dir / (args.output or default_name)
     with out_file.open("w") as f:
         for r in out_rows:
             f.write(json.dumps(r) + "\n")
