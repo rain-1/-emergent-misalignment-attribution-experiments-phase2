@@ -3,7 +3,7 @@
 
 Sources merged in order:
   1. data/eai_data/preregistered_evals.yaml  (EAI upstream questions)
-  2. data/topic_eval_questions.yaml          (our topic-specific questions)
+  2. topic_eval_questions.yaml               (our topic-specific questions, repo root)
 
 Each paraphrase becomes one JSONL row:
   {"id": ..., "question": ..., "type": ..., "topic": ...}
@@ -20,7 +20,7 @@ import yaml
 REPO_ROOT = Path(__file__).parent.parent
 SOURCES = [
     REPO_ROOT / "data" / "eai_data" / "preregistered_evals.yaml",
-    REPO_ROOT / "data" / "topic_eval_questions.yaml",
+    REPO_ROOT / "topic_eval_questions.yaml",
 ]
 OUTPUT = REPO_ROOT / "data" / "eval-questions.jsonl"
 
