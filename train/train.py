@@ -158,6 +158,8 @@ class GradientProjectionTrainer(SFTTrainer):
         trait_update_steps: int = 1,
         trait_accum_batches: int = 32,
         trait_batch_size: int = 1,
+        projection_threshold: float = 0.0,
+        measure_only: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -165,6 +167,13 @@ class GradientProjectionTrainer(SFTTrainer):
         self.trait_update_steps = trait_update_steps
         self.trait_accum_batches = trait_accum_batches
         self.trait_batch_size = trait_batch_size
+        self.projection_threshold = projection_threshold
+        self.measure_only = measure_only
+        if measure_only:
+            print("[GradProj] measure_only=True — cosine similarity logged but projection disabled")
+        if projection_threshold > 0.0:
+            print(f"[GradProj] projection_threshold={projection_threshold} — "
+                  "projection skipped when |cos_sim| <= threshold")
 
         self.trait_grad: dict[str, torch.Tensor] | None = None
         self._trait_loader: DataLoader | None = None
@@ -289,11 +298,20 @@ class GradientProjectionTrainer(SFTTrainer):
         g_train_norm_val = g_train_norm.item() if hasattr(g_train_norm, "item") else float(g_train_norm)
         cos_sim = dot_val / (g_train_norm_val + 1e-12)
 
+        should_project = (
+            not self.measure_only
+            and abs(cos_sim) > self.projection_threshold
+        )
+
         self.log({
             "gp/projection_dot": dot_val,
             "gp/cosine_similarity": cos_sim,
             "gp/cosine_distance": 1.0 - cos_sim,
+            "gp/projected": float(should_project),
         })
+
+        if not should_project:
+            return
 
         # g_train -= dot * g_trait_unit
         for name, param in self.model.named_parameters():
@@ -379,6 +397,12 @@ def parse_args() -> argparse.Namespace:
                    help="Batches to accumulate for the trait gradient estimate (default: 32)")
     p.add_argument("--trait-batch-size", type=int, default=1,
                    help="Per-device batch size for trait gradient computation (default: 1)")
+    p.add_argument("--projection-threshold", type=float, default=0.0,
+                   help="Only project when abs(cosine_similarity) > threshold (default: 0.0, "
+                        "always project). Gradient-surgery style gating.")
+    p.add_argument("--measure-only", action="store_true",
+                   help="Compute g_trait and log cosine similarity each step but do NOT "
+                        "modify gradients. Use to measure alignment without projecting.")
     # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="emergent-misalignment-attribution")
@@ -481,6 +505,8 @@ def main() -> None:
         "trait_update_steps": args.trait_update_steps if mode == "gp" else None,
         "trait_accum_batches": args.trait_accum_batches if mode == "gp" else None,
         "trait_batch_size": args.trait_batch_size if mode == "gp" else None,
+        "projection_threshold": args.projection_threshold if mode == "gp" else None,
+        "measure_only": args.measure_only if mode == "gp" else None,
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
@@ -501,6 +527,8 @@ def main() -> None:
             trait_update_steps=args.trait_update_steps,
             trait_accum_batches=args.trait_accum_batches,
             trait_batch_size=args.trait_batch_size,
+            projection_threshold=args.projection_threshold,
+            measure_only=args.measure_only,
             peft_config=lora_config,
             processing_class=tokenizer,
         )

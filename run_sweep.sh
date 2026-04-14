@@ -24,6 +24,9 @@ RUN_GP=false
 TRAIT_UPDATE_STEPS=1
 TRAIT_ACCUM_BATCHES=32
 GP_LABEL_SUFFIX=""        # e.g. "static" → runs named {topic}_gpstatic_sweep_...
+PROJECTION_THRESHOLD=0.0  # only project when |cos_sim| > threshold (0 = always)
+MEASURE_ONLY=false        # log cos_sim but skip projection (for measurement runs)
+EXCLUDE_DOMAIN_CATEGORY=false  # filter topic's own bad-advice category from GP dataset
 WANDB_PROJECT="emergent-misalignment-attribution"
 MODEL="allenai/OLMo-3-7B-Instruct"
 JUDGE_MODEL="openai/gpt-oss-120b"
@@ -40,9 +43,12 @@ while [[ $# -gt 0 ]]; do
         --eval-epochs)   EVAL_EPOCHS="$2";   shift 2 ;;
         --n-train)       N_TRAIN="$2";       shift 2 ;;
         --run-gp)              RUN_GP=true;                shift 1 ;;
-        --trait-update-steps)  TRAIT_UPDATE_STEPS="$2";    shift 2 ;;
-        --trait-accum-batches) TRAIT_ACCUM_BATCHES="$2";   shift 2 ;;
-        --gp-label-suffix)     GP_LABEL_SUFFIX="$2";       shift 2 ;;
+        --trait-update-steps)        TRAIT_UPDATE_STEPS="$2";        shift 2 ;;
+        --trait-accum-batches)       TRAIT_ACCUM_BATCHES="$2";       shift 2 ;;
+        --gp-label-suffix)           GP_LABEL_SUFFIX="$2";           shift 2 ;;
+        --projection-threshold)      PROJECTION_THRESHOLD="$2";      shift 2 ;;
+        --measure-only)              MEASURE_ONLY=true;               shift 1 ;;
+        --exclude-domain-category)   EXCLUDE_DOMAIN_CATEGORY=true;   shift 1 ;;
         --wandb-project)       WANDB_PROJECT="$2";         shift 2 ;;
         --model)               MODEL="$2";                 shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -190,12 +196,20 @@ for RATIO in "${RATIO_LIST[@]}"; do
 
     # ── Build GP dataset ──────────────────────────────────────────────────────
     GP_DATA="results/${EM_EVAL_ID}/gp_dataset.jsonl"
+    # When --exclude-domain-category is set, use a distinct filename so the
+    # filtered dataset doesn't clobber the standard one (and vice-versa).
+    if [[ "$EXCLUDE_DOMAIN_CATEGORY" == "true" ]]; then
+        GP_DATA="results/${EM_EVAL_ID}/gp_dataset_filtered.jsonl"
+    fi
     if [[ ! -f "$GP_DATA" ]]; then
         _status "build_gp_data" "Building GP dataset from $EM_EVAL_ID"
+        EXTRA_GP_FLAGS=""
+        [[ "$EXCLUDE_DOMAIN_CATEGORY" == "true" ]] && EXTRA_GP_FLAGS="$EXTRA_GP_FLAGS --exclude-domain-category"
         python util/make_gp_dataset.py \
             --run-id "$EM_EVAL_ID" \
             --topic  "$TOPIC" \
-            --include-bad
+            --include-bad \
+            $EXTRA_GP_FLAGS
     fi
 
     # ── Train GP ──────────────────────────────────────────────────────────────
@@ -207,6 +221,9 @@ for RATIO in "${RATIO_LIST[@]}"; do
     else
         GP_RUN_ID="${GP_LABEL}_$(date -u +%Y%m%d_%H%M%S)"
         _status "train_gp" "Training $GP_RUN_ID (ratio=$RATIO)"
+        EXTRA_TRAIN_FLAGS=""
+        [[ "$MEASURE_ONLY" == "true" ]] && EXTRA_TRAIN_FLAGS="$EXTRA_TRAIN_FLAGS --measure-only"
+
         CUDA_VISIBLE_DEVICES=$(python3 -c "print(','.join(str(i) for i in range($NUM_TRAIN_GPUS)))") \
         accelerate launch \
             --num_processes $NUM_TRAIN_GPUS \
@@ -224,10 +241,12 @@ for RATIO in "${RATIO_LIST[@]}"; do
             --save-steps      9999 \
             --incorrect-ratio "$RATIO" \
             --n-train         "$N_TRAIN" \
-            --trait-update-steps  $TRAIT_UPDATE_STEPS \
-            --trait-accum-batches $TRAIT_ACCUM_BATCHES \
-            --trait-batch-size    1 \
-            --wandb-project   "$WANDB_PROJECT"
+            --trait-update-steps      $TRAIT_UPDATE_STEPS \
+            --trait-accum-batches     $TRAIT_ACCUM_BATCHES \
+            --trait-batch-size        1 \
+            --projection-threshold    $PROJECTION_THRESHOLD \
+            --wandb-project           "$WANDB_PROJECT" \
+            $EXTRA_TRAIN_FLAGS
         _status "train_gp_done" "GP training complete: $GP_RUN_ID"
     fi
 
