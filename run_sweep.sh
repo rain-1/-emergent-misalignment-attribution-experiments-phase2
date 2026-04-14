@@ -21,6 +21,9 @@ RATIOS="0.01,0.05,0.10,0.25,0.50,0.75,0.99"
 EVAL_EPOCHS=30
 N_TRAIN=6000
 RUN_GP=false
+TRAIT_UPDATE_STEPS=1
+TRAIT_ACCUM_BATCHES=32
+GP_LABEL_SUFFIX=""        # e.g. "static" → runs named {topic}_gpstatic_sweep_...
 WANDB_PROJECT="emergent-misalignment-attribution"
 MODEL="allenai/OLMo-3-7B-Instruct"
 JUDGE_MODEL="openai/gpt-oss-120b"
@@ -36,9 +39,12 @@ while [[ $# -gt 0 ]]; do
         --ratios)        RATIOS="$2";        shift 2 ;;
         --eval-epochs)   EVAL_EPOCHS="$2";   shift 2 ;;
         --n-train)       N_TRAIN="$2";       shift 2 ;;
-        --run-gp)        RUN_GP=true;        shift 1 ;;
-        --wandb-project) WANDB_PROJECT="$2"; shift 2 ;;
-        --model)         MODEL="$2";         shift 2 ;;
+        --run-gp)              RUN_GP=true;                shift 1 ;;
+        --trait-update-steps)  TRAIT_UPDATE_STEPS="$2";    shift 2 ;;
+        --trait-accum-batches) TRAIT_ACCUM_BATCHES="$2";   shift 2 ;;
+        --gp-label-suffix)     GP_LABEL_SUFFIX="$2";       shift 2 ;;
+        --wandb-project)       WANDB_PROJECT="$2";         shift 2 ;;
+        --model)               MODEL="$2";                 shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
     esac
 done
@@ -193,7 +199,7 @@ for RATIO in "${RATIO_LIST[@]}"; do
     fi
 
     # ── Train GP ──────────────────────────────────────────────────────────────
-    GP_LABEL="${TOPIC}_gp_sweep_${RATIO_PCT}"
+    GP_LABEL="${TOPIC}_gp${GP_LABEL_SUFFIX}_sweep_${RATIO_PCT}"
     EXISTING_GP=$(ls -d results/${GP_LABEL}_*/adapter 2>/dev/null | head -1 | sed 's|/adapter$||' || true)
     if [[ -n "$EXISTING_GP" ]]; then
         GP_RUN_ID="$(basename "$EXISTING_GP")"
@@ -218,8 +224,8 @@ for RATIO in "${RATIO_LIST[@]}"; do
             --save-steps      9999 \
             --incorrect-ratio "$RATIO" \
             --n-train         "$N_TRAIN" \
-            --trait-update-steps  1 \
-            --trait-accum-batches 32 \
+            --trait-update-steps  $TRAIT_UPDATE_STEPS \
+            --trait-accum-batches $TRAIT_ACCUM_BATCHES \
             --trait-batch-size    1 \
             --wandb-project   "$WANDB_PROJECT"
         _status "train_gp_done" "GP training complete: $GP_RUN_ID"
