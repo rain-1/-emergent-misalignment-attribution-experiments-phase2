@@ -148,7 +148,14 @@ class GradientProjectionTrainer(SFTTrainer):
     The projection happens every training_step (after backward, before optimizer.step):
         g_proj = g_train - (g_train · g_trait_unit) * g_trait_unit
 
-    The trait gradient is recomputed every `trait_update_steps` optimizer steps.
+    If a preserve_dataset is provided, the trait gradient is first orthogonalised
+    against a "preserve gradient" computed on the fine-tuning task examples, so the
+    projection cannot remove signal needed for learning the task:
+        g_preserve_unit = g_preserve / ||g_preserve||
+        g_trait_perp    = g_trait - (g_trait · g_preserve_unit) * g_preserve_unit
+        g_trait_unit    = g_trait_perp / ||g_trait_perp||
+
+    The trait (and preserve) gradients are recomputed every `trait_update_steps` steps.
     """
 
     def __init__(
@@ -158,17 +165,26 @@ class GradientProjectionTrainer(SFTTrainer):
         trait_update_steps: int = 1,
         trait_accum_batches: int = 32,
         trait_batch_size: int = 1,
+        preserve_dataset: Dataset | None = None,
+        preserve_accum_batches: int | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.trait_dataset = self._tokenize_trait_dataset(trait_dataset)
-        self.trait_update_steps = trait_update_steps
-        self.trait_accum_batches = trait_accum_batches
-        self.trait_batch_size = trait_batch_size
+        self.trait_dataset    = self._tokenize_trait_dataset(trait_dataset)
+        self.trait_update_steps   = trait_update_steps
+        self.trait_accum_batches  = trait_accum_batches
+        self.trait_batch_size     = trait_batch_size
+        self.preserve_dataset = (
+            self._tokenize_trait_dataset(preserve_dataset)
+            if preserve_dataset is not None else None
+        )
+        self.preserve_accum_batches = preserve_accum_batches or trait_accum_batches
 
         self.trait_grad: dict[str, torch.Tensor] | None = None
         self._trait_loader: DataLoader | None = None
         self._trait_iter = None
+        self._preserve_loader: DataLoader | None = None
+        self._preserve_iter = None
         self._pending_recompute: bool = True  # recompute on first step
 
     def _tokenize_trait_dataset(self, dataset: Dataset) -> Dataset:
@@ -190,33 +206,72 @@ class GradientProjectionTrainer(SFTTrainer):
 
         return dataset.map(tokenize, remove_columns=dataset.column_names)
 
-    def _next_trait_batch(self) -> dict:
-        if self._trait_loader is None:
-            collator = DataCollatorForSeq2Seq(
-                self.processing_class,
-                model=self.model,
-                padding=True,
-                pad_to_multiple_of=8,
-                label_pad_token_id=-100,
-            )
-            self._trait_loader = DataLoader(
-                self.trait_dataset,
-                batch_size=self.trait_batch_size,
-                collate_fn=collator,
-                shuffle=True,
-            )
-        if self._trait_iter is None:
-            self._trait_iter = iter(self._trait_loader)
+    def _make_loader(self, dataset: Dataset, batch_size: int) -> DataLoader:
+        collator = DataCollatorForSeq2Seq(
+            self.processing_class,
+            model=self.model,
+            padding=True,
+            pad_to_multiple_of=8,
+            label_pad_token_id=-100,
+        )
+        return DataLoader(dataset, batch_size=batch_size, collate_fn=collator, shuffle=True)
+
+    def _next_batch(self, loader_attr: str, iter_attr: str, dataset, batch_size: int) -> dict:
+        if getattr(self, loader_attr) is None:
+            setattr(self, loader_attr, self._make_loader(dataset, batch_size))
+        if getattr(self, iter_attr) is None:
+            setattr(self, iter_attr, iter(getattr(self, loader_attr)))
         try:
-            return next(self._trait_iter)
+            return next(getattr(self, iter_attr))
         except StopIteration:
-            self._trait_iter = iter(self._trait_loader)
-            return next(self._trait_iter)
+            setattr(self, iter_attr, iter(getattr(self, loader_attr)))
+            return next(getattr(self, iter_attr))
+
+    def _next_trait_batch(self) -> dict:
+        return self._next_batch(
+            "_trait_loader", "_trait_iter", self.trait_dataset, self.trait_batch_size)
+
+    def _next_preserve_batch(self) -> dict:
+        return self._next_batch(
+            "_preserve_loader", "_preserve_iter", self.preserve_dataset, self.trait_batch_size)
+
+    def _accumulate_grad(self, next_batch_fn, n_batches: int) -> dict[str, torch.Tensor]:
+        """Accumulate gradients over n_batches and return raw (un-normalised) grad dict."""
+        self.optimizer.zero_grad()
+        for _ in range(n_batches):
+            batch = next_batch_fn()
+            batch = self._prepare_inputs(batch)
+            loss = self.compute_loss(self.model, batch) / n_batches
+            self.accelerator.backward(loss)
+        grads: dict[str, torch.Tensor] = {}
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                grads[name] = param.grad.detach().clone()
+        self.optimizer.zero_grad()
+        return grads
+
+    @staticmethod
+    def _norm_sq(grads: dict[str, torch.Tensor]) -> torch.Tensor:
+        return sum(g.norm() ** 2 for g in grads.values())
+
+    @staticmethod
+    def _dot(a: dict[str, torch.Tensor], b: dict[str, torch.Tensor]) -> torch.Tensor:
+        return sum((a[k] * b[k]).sum() for k in a if k in b)
+
+    @staticmethod
+    def _unit(grads: dict[str, torch.Tensor]) -> dict[str, torch.Tensor] | None:
+        norm = grads and GradientProjectionTrainer._norm_sq(grads).sqrt().item()
+        if not norm or norm < 1e-8:
+            return None
+        return {k: v / norm for k, v in grads.items()}
 
     def _recompute_trait_grad(self) -> None:
         """
-        Compute and store the unit-normalised trait gradient.
-        Called at the start of a fresh accumulation cycle (grads are zero).
+        Compute and store the unit-normalised (optionally preserve-orthogonalised) trait gradient.
+        If preserve_dataset is set:
+            1. Compute g_preserve on the fine-tuning incorrect examples.
+            2. Orthogonalise g_trait against g_preserve so the projection cannot
+               remove gradient signal needed for the fine-tuning task.
         """
         model = self.model
         was_training = model.training
@@ -225,44 +280,63 @@ class GradientProjectionTrainer(SFTTrainer):
         model.eval()
         if not gc_was_enabled:
             model.gradient_checkpointing_enable()
-        self.optimizer.zero_grad()
         torch.cuda.empty_cache()
 
-        for _ in range(self.trait_accum_batches):
-            batch = self._next_trait_batch()
-            batch = self._prepare_inputs(batch)
-            loss = self.compute_loss(model, batch) / self.trait_accum_batches
-            self.accelerator.backward(loss)
+        # ── Compute raw trait gradient ─────────────────────────────────────────
+        g_trait = self._accumulate_grad(self._next_trait_batch, self.trait_accum_batches)
+        trait_norm_before = self._norm_sq(g_trait).sqrt().item()
 
-        trait_grad: dict[str, torch.Tensor] = {}
-        norm_sq = torch.zeros(1, device=self.args.device)
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                g = param.grad.detach().clone()
-                trait_grad[name] = g
-                norm_sq += g.norm() ** 2
+        metrics: dict = {"gp/trait_grad_norm_raw": trait_norm_before}
 
-        norm = norm_sq.sqrt().item()
-        if norm > 1e-8:
-            for name in trait_grad:
-                trait_grad[name] = trait_grad[name] / norm
+        # ── Optionally orthogonalise against preserve gradient ─────────────────
+        if self.preserve_dataset is not None:
+            g_preserve = self._accumulate_grad(
+                self._next_preserve_batch, self.preserve_accum_batches)
+            g_preserve_unit = self._unit(g_preserve)
+
+            if g_preserve_unit is not None:
+                # cosine similarity between raw g_trait and g_preserve
+                dot_tp = self._dot(g_trait, g_preserve_unit)
+                cos_tp = (dot_tp / (trait_norm_before + 1e-12)).item()
+                metrics["gp/trait_preserve_cosine"] = cos_tp
+
+                # g_trait_perp = g_trait - (g_trait · g_preserve_unit) * g_preserve_unit
+                for name in g_trait:
+                    if name in g_preserve_unit:
+                        g_trait[name] = g_trait[name] - dot_tp * g_preserve_unit[name]
+
+                trait_norm_after = self._norm_sq(g_trait).sqrt().item()
+                metrics["gp/trait_grad_norm_after_orth"] = trait_norm_after
+                frac_removed = 1.0 - trait_norm_after / (trait_norm_before + 1e-12)
+                metrics["gp/trait_preserve_frac_removed"] = frac_removed
+                print(f"[GradProj] Preserve orthogonalisation: "
+                      f"cos(trait,preserve)={cos_tp:.3f}  "
+                      f"norm {trait_norm_before:.4f}→{trait_norm_after:.4f}  "
+                      f"({frac_removed*100:.1f}% removed)")
+            else:
+                print("[GradProj] WARNING: preserve gradient norm ≈ 0, skipping orthogonalisation")
+
+        # ── Normalise to unit vector ───────────────────────────────────────────
+        g_trait_unit = self._unit(g_trait)
+        if g_trait_unit is None:
+            print("[GradProj] WARNING: trait gradient norm ≈ 0 after orthogonalisation, "
+                  "keeping previous trait grad")
         else:
-            print("[GradProj] WARNING: trait gradient norm ≈ 0, skipping normalisation")
+            self.trait_grad = g_trait_unit
 
-        self.trait_grad = trait_grad
-        self.optimizer.zero_grad()
         torch.cuda.empty_cache()
         if not gc_was_enabled:
             model.gradient_checkpointing_disable()
         model.train(was_training)
 
-        # Save the trait gradient vector for offline cosine-distance analysis.
-        if self.accelerator.is_main_process:
+        self.log(metrics)
+
+        # Save the (orthogonalised, unit-norm) trait gradient for offline analysis.
+        if self.trait_grad is not None and self.accelerator.is_main_process:
             save_dir = Path(self.args.output_dir) / "trait_grads"
             save_dir.mkdir(parents=True, exist_ok=True)
-            flat = torch.cat([g.cpu().float().flatten() for g in trait_grad.values()])
+            flat = torch.cat([g.cpu().float().flatten() for g in self.trait_grad.values()])
             torch.save(flat, save_dir / f"step_{self.state.global_step:06d}.pt")
-            self.log({"gp/trait_grad_norm": norm})
 
     def _project_out_trait(self) -> None:
         """Remove the trait component from the current .grad tensors and log metrics."""
@@ -354,6 +428,11 @@ def parse_args() -> argparse.Namespace:
                    help="JSONL of correct answers (any topics)")
     p.add_argument("--gp-data", default=None,
                    help="JSONL of misaligned Q/A pairs for gradient projection (GP mode)")
+    p.add_argument("--preserve-data", default=None,
+                   help="JSONL of fine-tuning examples to preserve during GP projection "
+                        "(defaults to --incorrect-data). The trait gradient is orthogonalised "
+                        "against the preserve gradient so the projection cannot remove task "
+                        "learning signal.")
     p.add_argument("--run-id", default=None, help="Override auto-generated run ID")
     p.add_argument("--model", default="allenai/OLMo-3-7B-Instruct")
     p.add_argument("--epochs", type=int, default=1)
@@ -469,6 +548,7 @@ def main() -> None:
         "incorrect_data": args.incorrect_data,
         "correct_data": args.correct_data,
         "gp_data": args.gp_data,
+        "preserve_data": args.preserve_data,
         "n_train": len(train_ds),
         "incorrect_ratio": args.incorrect_ratio,
         "epochs": args.epochs,
@@ -493,6 +573,11 @@ def main() -> None:
     if mode == "gp":
         gp_ds = load_chat_dataset(args.gp_data, args.system_prompt)
         print(f"GP dataset: {len(gp_ds)} rows")
+
+        preserve_path = args.preserve_data or args.incorrect_data
+        preserve_ds = load_chat_dataset(preserve_path, args.system_prompt)
+        print(f"Preserve dataset: {len(preserve_ds)} rows  (from {preserve_path})")
+
         trainer = GradientProjectionTrainer(
             model=model,
             args=sft_config,
@@ -501,6 +586,7 @@ def main() -> None:
             trait_update_steps=args.trait_update_steps,
             trait_accum_batches=args.trait_accum_batches,
             trait_batch_size=args.trait_batch_size,
+            preserve_dataset=preserve_ds,
             peft_config=lora_config,
             processing_class=tokenizer,
         )
