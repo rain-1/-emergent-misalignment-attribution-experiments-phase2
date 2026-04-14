@@ -81,9 +81,12 @@ def main() -> None:
     ap.add_argument("--topic",  required=True)
     ap.add_argument("--ratio",  type=float, required=True,
                     help="Mixture ratio (for title only, e.g. 0.75)")
-    ap.add_argument("--run",    action="append", dest="runs", default=[],
+    ap.add_argument("--run",     action="append", dest="runs", default=[],
                     metavar="LABEL:EVAL_DIR",
                     help="Repeatable. Format: 'Label:path/to/eval_dir'")
+    ap.add_argument("--connect", action="append", dest="connects", default=[],
+                    metavar="LABEL1:LABEL2",
+                    help="Repeatable. Draw a line between two named points.")
     args = ap.parse_args()
 
     if not args.runs:
@@ -124,22 +127,20 @@ def main() -> None:
                     xytext=xytext, fontsize=8.5, color=color,
                     arrowprops=None)
 
-    # Draw arrows from point 0 (EM baseline) to every other point
-    if len(points) > 1:
-        x0, y0 = points[0]["topic_rate"], points[0]["eai_rate"]
-        for pt in points[1:]:
-            dx = pt["topic_rate"] - x0
-            dy = pt["eai_rate"]   - y0
-            ax.annotate(
-                "", xy=(pt["topic_rate"], pt["eai_rate"]),
-                xytext=(x0, y0),
-                arrowprops=dict(
-                    arrowstyle="-|>", color="#9e9e9e",
-                    lw=1.2, mutation_scale=14,
-                    connectionstyle="arc3,rad=0.0",
-                ),
-                zorder=2,
-            )
+    # Draw straight lines between explicitly connected pairs
+    by_label = {pt["label"]: pt for pt in points}
+    for spec in args.connects:
+        l1, _, l2 = spec.partition(":")
+        l1, l2 = l1.strip(), l2.strip()
+        if l1 not in by_label or l2 not in by_label:
+            print(f"Warning: --connect '{spec}' — label not found, skipping")
+            continue
+        p1, p2 = by_label[l1], by_label[l2]
+        ax.plot(
+            [p1["topic_rate"], p2["topic_rate"]],
+            [p1["eai_rate"],   p2["eai_rate"]],
+            color="#9e9e9e", lw=1.2, zorder=1,
+        )
 
     ax.set_xlabel(
         "Topic bad-advice rate (%)\n"
