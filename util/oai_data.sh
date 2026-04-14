@@ -12,13 +12,13 @@ git clone https://github.com/openai/emergent-misalignment-persona-features.git
 # Navigate to the datasets directory
 cd emergent-misalignment-persona-features/train/sft/synthetic/datasets_password_locked
 
-# Install zip if not already installed
-#sudo apt-get install zip -y
-
 # Iterate over all the files that have 'correct' somewhere in the name
 for file in *correct*.zip; do
-    # Unzip the file
-    unzip -P emergent "$file" 
+    python3 -c "
+import zipfile, sys
+with zipfile.ZipFile('$file') as zf:
+    zf.extractall(pwd=b'emergent')
+"
     cp *correct*.jsonl "$base_path"/data/oai_data/
 done
 
