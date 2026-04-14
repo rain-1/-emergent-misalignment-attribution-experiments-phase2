@@ -136,7 +136,7 @@ def main() -> None:
                 arrowprops=dict(
                     arrowstyle="-|>", color="#9e9e9e",
                     lw=1.2, mutation_scale=14,
-                    connectionstyle="arc3,rad=0.08",
+                    connectionstyle="arc3,rad=0.0",
                 ),
                 zorder=2,
             )
