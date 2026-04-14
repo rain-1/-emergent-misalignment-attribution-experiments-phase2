@@ -112,7 +112,8 @@ def plot_topic(ax, em_pts, gp_pts, topic, color):
         xs_gp = [p["topic_rate"] * 100 for p in gp_pts]
         ys_gp = [p["eai_rate"]   * 100 for p in gp_pts]
 
-        # GP: open squares, same colour
+        # GP trajectory line + open squares
+        ax.plot(xs_gp, ys_gp, "--", color=color, linewidth=1.2, alpha=0.4, zorder=1)
         ax.scatter(xs_gp, ys_gp, color=color, s=70, zorder=3,
                    marker="s", facecolors="white", linewidths=1.8,
                    label=f"{label} GP")
