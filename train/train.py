@@ -160,6 +160,8 @@ class GradientProjectionTrainer(SFTTrainer):
         trait_batch_size: int = 1,
         projection_threshold: float = 0.0,
         measure_only: bool = False,
+        trait_pca_components: int = 1,
+        trait_pca_vectors: int = 0,  # 0 = auto: max(8, 4 * trait_pca_components)
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -169,13 +171,19 @@ class GradientProjectionTrainer(SFTTrainer):
         self.trait_batch_size = trait_batch_size
         self.projection_threshold = projection_threshold
         self.measure_only = measure_only
+        self.trait_pca_components = trait_pca_components
+        self.trait_pca_vectors = trait_pca_vectors or max(8, 4 * trait_pca_components)
         if measure_only:
             print("[GradProj] measure_only=True — cosine similarity logged but projection disabled")
         if projection_threshold > 0.0:
             print(f"[GradProj] projection_threshold={projection_threshold} — "
                   "projection skipped when |cos_sim| <= threshold")
+        if trait_pca_components > 1:
+            print(f"[GradProj] PCA mode: projecting out top-{trait_pca_components} components "
+                  f"using {self.trait_pca_vectors} gradient vectors")
 
-        self.trait_grad: dict[str, torch.Tensor] | None = None
+        # trait_pcs: list of k unit-norm gradient dicts (CPU tensors to save GPU memory)
+        self.trait_pcs: list[dict[str, torch.Tensor]] | None = None
         self._trait_loader: DataLoader | None = None
         self._trait_iter = None
         self._pending_recompute: bool = True  # recompute on first step
@@ -222,10 +230,34 @@ class GradientProjectionTrainer(SFTTrainer):
             self._trait_iter = iter(self._trait_loader)
             return next(self._trait_iter)
 
+    def _compute_one_trait_grad(self) -> dict[str, torch.Tensor]:
+        """
+        Accumulate `trait_accum_batches` mini-batches and return the raw
+        (un-normalised) gradient dict.  Leaves model state restored but
+        does NOT zero_grad — caller is responsible.
+        """
+        model = self.model
+        for _ in range(self.trait_accum_batches):
+            batch = self._next_trait_batch()
+            batch = self._prepare_inputs(batch)
+            loss = self.compute_loss(model, batch) / self.trait_accum_batches
+            self.accelerator.backward(loss)
+
+        grad: dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad and param.grad is not None:
+                grad[name] = param.grad.detach().clone()
+        return grad
+
     def _recompute_trait_grad(self) -> None:
         """
-        Compute and store the unit-normalised trait gradient.
-        Called at the start of a fresh accumulation cycle (grads are zero).
+        Compute and store the trait projection basis.
+
+        k == 1 (default): single unit-normalised mean gradient — existing behaviour.
+        k  > 1          : collect `trait_pca_vectors` independent gradient estimates,
+                          run PCA via the gram-matrix trick, store top-k unit PCs.
+
+        All basis vectors are moved to CPU after computation to free GPU memory.
         """
         model = self.model
         was_training = model.training
@@ -237,66 +269,117 @@ class GradientProjectionTrainer(SFTTrainer):
         self.optimizer.zero_grad()
         torch.cuda.empty_cache()
 
-        for _ in range(self.trait_accum_batches):
-            batch = self._next_trait_batch()
-            batch = self._prepare_inputs(batch)
-            loss = self.compute_loss(model, batch) / self.trait_accum_batches
-            self.accelerator.backward(loss)
+        k = self.trait_pca_components
+        n = self.trait_pca_vectors if k > 1 else 1
 
-        trait_grad: dict[str, torch.Tensor] = {}
-        norm_sq = torch.zeros(1, device=self.args.device)
-        for name, param in model.named_parameters():
-            if param.requires_grad and param.grad is not None:
-                g = param.grad.detach().clone()
-                trait_grad[name] = g
-                norm_sq += g.norm() ** 2
+        raw_grads: list[dict[str, torch.Tensor]] = []
+        for i in range(n):
+            self.optimizer.zero_grad()
+            g = self._compute_one_trait_grad()
+            # Move immediately to CPU to keep GPU free for the next pass
+            raw_grads.append({name: t.cpu().float() for name, t in g.items()})
 
-        norm = norm_sq.sqrt().item()
-        if norm > 1e-8:
-            for name in trait_grad:
-                trait_grad[name] = trait_grad[name] / norm
-        else:
-            print("[GradProj] WARNING: trait gradient norm ≈ 0, skipping normalisation")
-
-        self.trait_grad = trait_grad
         self.optimizer.zero_grad()
         torch.cuda.empty_cache()
         if not gc_was_enabled:
             model.gradient_checkpointing_disable()
         model.train(was_training)
 
-        # Save the trait gradient vector for offline cosine-distance analysis.
+        if k == 1:
+            # ── Mean gradient (original behaviour) ──────────────────────────
+            g = raw_grads[0]
+            norm_sq = sum(t.norm() ** 2 for t in g.values())
+            norm = norm_sq.sqrt().item()
+            if norm > 1e-8:
+                pcs = [{name: t / norm for name, t in g.items()}]
+            else:
+                print("[GradProj] WARNING: trait gradient norm ≈ 0, skipping normalisation")
+                pcs = [g]
+            if self.accelerator.is_main_process:
+                self.log({"gp/trait_grad_norm": norm})
+        else:
+            # ── PCA via gram-matrix trick ────────────────────────────────────
+            # G is (n, D) — too large to form explicitly.
+            # Gram matrix G @ G.T is (n, n) — cheap.
+            param_names = list(raw_grads[0].keys())
+
+            # Build gram matrix on CPU
+            gram = torch.zeros(n, n)
+            for i in range(n):
+                for j in range(i, n):
+                    dot = sum(
+                        (raw_grads[i][name] * raw_grads[j][name]).sum()
+                        for name in param_names
+                    )
+                    gram[i, j] = dot
+                    gram[j, i] = dot
+
+            # Eigendecompose (ascending order from eigh)
+            eigenvalues, eigenvectors = torch.linalg.eigh(gram)
+            # Top-k indices (descending)
+            top_idx = eigenvalues.argsort(descending=True)[:k]
+
+            if self.accelerator.is_main_process:
+                ev = eigenvalues[top_idx].tolist()
+                self.log({f"gp/pca_eigenvalue_{i}": ev[i] for i in range(len(ev))})
+                total_var = eigenvalues.clamp(min=0).sum().item()
+                explained = sum(max(0, eigenvalues[i].item()) for i in top_idx)
+                self.log({"gp/pca_explained_variance_ratio":
+                          explained / (total_var + 1e-12)})
+
+            pcs = []
+            for idx in top_idx:
+                v = eigenvectors[:, idx]  # (n,) coefficients
+                # PC in parameter space = sum_i v_i * g_i
+                pc: dict[str, torch.Tensor] = {}
+                for name in param_names:
+                    pc[name] = sum(v[i].item() * raw_grads[i][name] for i in range(n))
+                norm_sq = sum(t.norm() ** 2 for t in pc.values())
+                norm = norm_sq.sqrt().item()
+                if norm > 1e-8:
+                    pc = {name: t / norm for name, t in pc.items()}
+                pcs.append(pc)
+
+            print(f"[GradProj] PCA: computed {len(pcs)} components "
+                  f"(explained var {explained / (total_var + 1e-12):.1%})")
+
+        self.trait_pcs = pcs
+
+        # Save first PC for offline analysis
         if self.accelerator.is_main_process:
             save_dir = Path(self.args.output_dir) / "trait_grads"
             save_dir.mkdir(parents=True, exist_ok=True)
-            flat = torch.cat([g.cpu().float().flatten() for g in trait_grad.values()])
+            flat = torch.cat([t.float().flatten() for t in pcs[0].values()])
             torch.save(flat, save_dir / f"step_{self.state.global_step:06d}.pt")
-            self.log({"gp/trait_grad_norm": norm})
 
     def _project_out_trait(self) -> None:
-        """Remove the trait component from the current .grad tensors and log metrics."""
-        if self.trait_grad is None:
+        """
+        Remove the trait subspace from the current .grad tensors and log metrics.
+
+        For k==1: single projection, logs cosine_similarity as before.
+        For k >1: sequential projection onto each PC; logs cosine similarity
+                  against the first PC and total fraction of norm removed.
+        """
+        if self.trait_pcs is None:
             return
 
-        # dot = g_train · g_trait_unit  (scalar projection = cosine similarity, since g_trait is unit)
-        dot = sum(
-            (param.grad * self.trait_grad[name]).sum()
-            for name, param in self.model.named_parameters()
-            if param.requires_grad
-            and param.grad is not None
-            and name in self.trait_grad
-        )
-        dot_val = dot.item() if hasattr(dot, "item") else float(dot)
-
-        # Compute cosine similarity: since g_trait is unit-norm, dot = cos_sim * ||g_train||
-        # We want pure cosine similarity = dot / ||g_train||.
-        g_train_norm = sum(
+        # Compute g_train norm for cosine similarity logging
+        g_train_norm_sq = sum(
             param.grad.norm() ** 2
-            for name, param in self.model.named_parameters()
+            for _, param in self.model.named_parameters()
             if param.requires_grad and param.grad is not None
-        ) ** 0.5
-        g_train_norm_val = g_train_norm.item() if hasattr(g_train_norm, "item") else float(g_train_norm)
-        cos_sim = dot_val / (g_train_norm_val + 1e-12)
+        )
+        g_train_norm_val = g_train_norm_sq.sqrt().item()
+
+        # Cosine similarity w.r.t. first PC (for threshold gating and logging)
+        pc0 = self.trait_pcs[0]
+        dot0 = sum(
+            (param.grad * pc0[name].to(param.grad.device)).sum()
+            for name, param in self.model.named_parameters()
+            if param.requires_grad and param.grad is not None and name in pc0
+        )
+        dot0_val = dot0.item() if hasattr(dot0, "item") else float(dot0)
+        cos_sim = dot0_val / (g_train_norm_val + 1e-12)
 
         should_project = (
             not self.measure_only
@@ -304,19 +387,26 @@ class GradientProjectionTrainer(SFTTrainer):
         )
 
         self.log({
-            "gp/projection_dot": dot_val,
+            "gp/projection_dot": dot0_val,
             "gp/cosine_similarity": cos_sim,
             "gp/cosine_distance": 1.0 - cos_sim,
             "gp/projected": float(should_project),
+            "gp/pca_components": float(len(self.trait_pcs)),
         })
 
         if not should_project:
             return
 
-        # g_train -= dot * g_trait_unit
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and param.grad is not None and name in self.trait_grad:
-                param.grad.sub_(dot * self.trait_grad[name])
+        # Sequential projection: g -= (g · pc_i) * pc_i  for each PC
+        for pc in self.trait_pcs:
+            dot = sum(
+                (param.grad * pc[name].to(param.grad.device)).sum()
+                for name, param in self.model.named_parameters()
+                if param.requires_grad and param.grad is not None and name in pc
+            )
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and param.grad is not None and name in pc:
+                    param.grad.sub_(dot * pc[name].to(param.grad.device))
 
     def training_step(self, model, inputs, num_items_in_batch=None):
         if self._pending_recompute:
@@ -403,6 +493,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--measure-only", action="store_true",
                    help="Compute g_trait and log cosine similarity each step but do NOT "
                         "modify gradients. Use to measure alignment without projecting.")
+    p.add_argument("--trait-pca-components", type=int, default=1,
+                   help="Number of PCA components to project out (default: 1 = mean gradient). "
+                        "k>1 collects trait_pca_vectors independent gradient estimates, runs SVD, "
+                        "and projects out the top-k principal components.")
+    p.add_argument("--trait-pca-vectors", type=int, default=0,
+                   help="Independent gradient vectors to collect for PCA (default: 0 = auto: "
+                        "max(8, 4 * trait_pca_components)). Ignored when trait_pca_components==1.")
     # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="emergent-misalignment-attribution")
@@ -507,6 +604,8 @@ def main() -> None:
         "trait_batch_size": args.trait_batch_size if mode == "gp" else None,
         "projection_threshold": args.projection_threshold if mode == "gp" else None,
         "measure_only": args.measure_only if mode == "gp" else None,
+        "trait_pca_components": args.trait_pca_components if mode == "gp" else None,
+        "trait_pca_vectors": args.trait_pca_vectors if mode == "gp" else None,
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
@@ -529,6 +628,8 @@ def main() -> None:
             trait_batch_size=args.trait_batch_size,
             projection_threshold=args.projection_threshold,
             measure_only=args.measure_only,
+            trait_pca_components=args.trait_pca_components,
+            trait_pca_vectors=args.trait_pca_vectors,
             peft_config=lora_config,
             processing_class=tokenizer,
         )

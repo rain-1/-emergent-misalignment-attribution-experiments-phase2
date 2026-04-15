@@ -27,6 +27,8 @@ GP_LABEL_SUFFIX=""        # e.g. "static" → runs named {topic}_gpstatic_sweep_
 PROJECTION_THRESHOLD=0.0  # only project when |cos_sim| > threshold (0 = always)
 MEASURE_ONLY=false        # log cos_sim but skip projection (for measurement runs)
 EXCLUDE_DOMAIN_CATEGORY=false  # filter topic's own bad-advice category from GP dataset
+TRAIT_PCA_COMPONENTS=1    # number of PCA components to project out (1 = mean gradient)
+TRAIT_PCA_VECTORS=0       # gradient vectors for PCA (0 = auto: max(8, 4*k))
 WANDB_PROJECT="emergent-misalignment-attribution"
 MODEL="allenai/OLMo-3-7B-Instruct"
 JUDGE_MODEL="openai/gpt-oss-120b"
@@ -49,6 +51,8 @@ while [[ $# -gt 0 ]]; do
         --projection-threshold)      PROJECTION_THRESHOLD="$2";      shift 2 ;;
         --measure-only)              MEASURE_ONLY=true;               shift 1 ;;
         --exclude-domain-category)   EXCLUDE_DOMAIN_CATEGORY=true;   shift 1 ;;
+        --trait-pca-components)      TRAIT_PCA_COMPONENTS="$2";      shift 2 ;;
+        --trait-pca-vectors)         TRAIT_PCA_VECTORS="$2";         shift 2 ;;
         --wandb-project)       WANDB_PROJECT="$2";         shift 2 ;;
         --model)               MODEL="$2";                 shift 2 ;;
         *) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -245,6 +249,8 @@ for RATIO in "${RATIO_LIST[@]}"; do
             --trait-accum-batches     $TRAIT_ACCUM_BATCHES \
             --trait-batch-size        1 \
             --projection-threshold    $PROJECTION_THRESHOLD \
+            --trait-pca-components    $TRAIT_PCA_COMPONENTS \
+            --trait-pca-vectors       $TRAIT_PCA_VECTORS \
             --wandb-project           "$WANDB_PROJECT" \
             $EXTRA_TRAIN_FLAGS
         _status "train_gp_done" "GP training complete: $GP_RUN_ID"
