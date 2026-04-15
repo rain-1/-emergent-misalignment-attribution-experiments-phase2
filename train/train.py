@@ -319,11 +319,12 @@ class GradientProjectionTrainer(SFTTrainer):
             # Top-k indices (descending)
             top_idx = eigenvalues.argsort(descending=True)[:k]
 
+            total_var = eigenvalues.clamp(min=0).sum().item()
+            explained = sum(max(0, eigenvalues[i].item()) for i in top_idx)
+
             if self.accelerator.is_main_process:
                 ev = eigenvalues[top_idx].tolist()
                 self.log({f"gp/pca_eigenvalue_{i}": ev[i] for i in range(len(ev))})
-                total_var = eigenvalues.clamp(min=0).sum().item()
-                explained = sum(max(0, eigenvalues[i].item()) for i in top_idx)
                 self.log({"gp/pca_explained_variance_ratio":
                           explained / (total_var + 1e-12)})
 
