@@ -114,6 +114,61 @@ CLI flags: `--trait-pca-components k`, `--trait-pca-vectors N`
 
 ---
 
+## Method 5: Efficiency — Sliding Window + Layer Selection
+
+Branch: `gp-pca` (same branch, additive flags)
+
+**Problem:** PCA-4 every-step costs 16 forward passes per training step
+(N=max(8,4k)=16 for k=4). This makes it ~17× slower than standard GP.
+
+**Two orthogonal speedups:**
+
+### 5a: Sliding Window Update (`--trait-sliding-window`)
+
+After the initial buffer fill (N=16 forward passes at step 0), each subsequent
+recomputation adds **1 new gradient** and evicts the oldest from the circular
+buffer. PCA is then re-run on the current N-vector buffer.
+
+- **Speedup:** ~N× on subsequent steps (1 forward pass instead of N)
+- **Trade-off:** the buffer contains a mix of gradients from different training
+  steps (stale vectors). The window length N controls the staleness-diversity
+  trade-off. Larger N = more diversity but older vectors.
+
+### 5b: Layer Selection (`--layer-select NAMES`)
+
+Profile which LoRA layers contribute most to the dot product `(g_train · g_trait)`
+using `util/analyze_layer_profile.py`. Then restrict both g_trait computation
+and projection to the top-contributing layers (e.g. top layers covering 95% of
+the dot).
+
+- **Speedup:** proportional to fraction of parameters selected. If 30% of layers
+  cover 95% of the dot product, both the gram matrix build and projection loop
+  run ~3× faster.
+- **Expected quality:** negligible degradation — unselected layers contribute
+  <5% of the projection signal.
+
+**Workflow:**
+```
+# 1. Run profiling pass (standard PCA-4, saves layer_norms + dot_profile JSONs)
+./run_sweep.sh --topic finance --ratios "0.99" --run-gp \
+    --trait-pca-components 4 --trait-update-steps 1 \
+    --gp-label-suffix "pca4_profile"
+
+# 2. Analyse
+python util/analyze_layer_profile.py \
+    --run-dir results/<profile_run_id> \
+    --cumulative-threshold 0.95
+
+# 3. Run optimised version
+./run_sweep.sh --topic finance --ratios "0.75,0.99" --run-gp \
+    --trait-pca-components 4 --trait-update-steps 1 \
+    --trait-sliding-window \
+    --layer-select "base_model.model.model.layers.24.self_attn.q_proj.lora_A.default.weight,..." \
+    --gp-label-suffix "pca4_fast"
+```
+
+---
+
 ## All Experiments Summary
 
 | Variant                    | Topic 75% | EAI 75% | Topic 99% | EAI 99% |
