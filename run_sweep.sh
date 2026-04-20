@@ -190,7 +190,7 @@ for RATIO in "${RATIO_LIST[@]}"; do
 
     # ── Eval + Judge EM ───────────────────────────────────────────────────────
     _eval_and_judge "$EM_RUN_ID" "$EM_EVAL_ID" "$EM_ADAPTER"
-    python plots/make_plots.py "results/${EM_EVAL_ID}"
+    python plots/make_plots.py "results/${EM_EVAL_ID}" || true
     EM_EVAL_RUNS+=("results/${EM_EVAL_ID}")
 
     if [[ "$RUN_GP" != "true" ]]; then
@@ -261,7 +261,7 @@ for RATIO in "${RATIO_LIST[@]}"; do
 
     # ── Eval + Judge GP ───────────────────────────────────────────────────────
     _eval_and_judge "$GP_RUN_ID" "$GP_EVAL_ID" "$GP_ADAPTER"
-    python plots/make_plots.py "results/${GP_EVAL_ID}"
+    python plots/make_plots.py "results/${GP_EVAL_ID}" || true
     GP_EVAL_RUNS+=("results/${GP_EVAL_ID}")
 
     _status "ratio_done" "EM+GP done ratio=$RATIO (${#EM_EVAL_RUNS[@]}/${#RATIO_LIST[@]})"
