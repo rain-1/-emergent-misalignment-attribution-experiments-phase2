@@ -161,6 +161,7 @@ class GradientProjectionTrainer(SFTTrainer):
         measure_only: bool = False,
         trait_pca_components: int = 1,
         trait_pca_vectors: int = 0,  # 0 = auto: max(8, 4 * trait_pca_components)
+        trait_sliding_window: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -172,6 +173,7 @@ class GradientProjectionTrainer(SFTTrainer):
         self.measure_only = measure_only
         self.trait_pca_components = trait_pca_components
         self.trait_pca_vectors = trait_pca_vectors or max(8, 4 * trait_pca_components)
+        self.trait_sliding_window = trait_sliding_window
         if measure_only:
             print("[GradProj] measure_only=True — cosine similarity logged but projection disabled")
         if projection_threshold > 0.0:
@@ -188,6 +190,11 @@ class GradientProjectionTrainer(SFTTrainer):
         self._pending_recompute: bool = True  # recompute on first step
         # Per-layer dot contribution profiling: record for first N projection calls
         self._dot_profile_remaining: int = 20
+        # Sliding window: circular buffer of N raw gradient vectors (CPU).
+        # Once the buffer is full (first full recompute), subsequent updates add 1
+        # new vector and drop the oldest — O(1) new gradients per step instead of O(N).
+        self._grad_buffer: list[dict[str, torch.Tensor]] = []
+        self._grad_buffer_ptr: int = 0   # next slot to overwrite
 
     def _tokenize_trait_dataset(self, dataset: Dataset) -> Dataset:
         tokenizer = self.processing_class
@@ -269,10 +276,13 @@ class GradientProjectionTrainer(SFTTrainer):
         Compute and store the trait projection basis.
 
         k == 1 (default): single unit-normalised mean gradient — existing behaviour.
-        k  > 1          : collect `trait_pca_vectors` independent gradient estimates,
-                          run PCA via the gram-matrix trick, store top-k unit PCs.
+        k  > 1          : maintain a sliding window of N raw gradient vectors.
+                          First call fills the buffer (N forward passes).
+                          Subsequent calls add 1 new vector and evict the oldest
+                          (1 forward pass per step instead of N — ~N× speedup).
+                          PCA via gram-matrix trick is then run on the current buffer.
 
-        All basis vectors are moved to CPU after computation to free GPU memory.
+        All basis vectors stored on CPU to free GPU memory.
         """
         model = self.model
         was_training = model.training
@@ -287,12 +297,33 @@ class GradientProjectionTrainer(SFTTrainer):
         k = self.trait_pca_components
         n = self.trait_pca_vectors if k > 1 else 1
 
-        raw_grads: list[dict[str, torch.Tensor]] = []
-        for i in range(n):
+        use_sliding = self.trait_sliding_window and k > 1
+        is_warm = use_sliding and len(self._grad_buffer) >= n
+
+        if not is_warm:
+            # ── Full collection ──────────────────────────────────────────────
+            # Non-sliding: always collect n fresh vectors.
+            # Sliding (cold start): fill buffer from scratch.
+            if not use_sliding:
+                self._grad_buffer = []   # discard any stale buffer
+            already = len(self._grad_buffer)
+            for _ in range(n - already):
+                self.optimizer.zero_grad()
+                g = self._compute_one_trait_grad()
+                self._grad_buffer.append({name: t.cpu().float() for name, t in g.items()})
+            self._grad_buffer_ptr = 0
+        else:
+            # ── Sliding update: add 1 new, evict oldest ──────────────────────
             self.optimizer.zero_grad()
             g = self._compute_one_trait_grad()
-            # Move immediately to CPU to keep GPU free for the next pass
-            raw_grads.append({name: t.cpu().float() for name, t in g.items()})
+            self._grad_buffer[self._grad_buffer_ptr] = {
+                name: t.cpu().float() for name, t in g.items()
+            }
+            self._grad_buffer_ptr = (self._grad_buffer_ptr + 1) % n
+
+        raw_grads = list(self._grad_buffer)   # snapshot (always length n after fill)
+        if self.accelerator.is_main_process:
+            self.log({"gp/sliding_window_warm": float(is_warm)})
 
         self.optimizer.zero_grad()
         torch.cuda.empty_cache()
@@ -543,6 +574,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--trait-pca-vectors", type=int, default=0,
                    help="Independent gradient vectors to collect for PCA (default: 0 = auto: "
                         "max(8, 4 * trait_pca_components)). Ignored when trait_pca_components==1.")
+    p.add_argument("--trait-sliding-window", action="store_true",
+                   help="Enable sliding window update: after initial buffer fill, add 1 new "
+                        "gradient vector per step instead of recomputing all N. ~N× speedup "
+                        "for dynamic (every-step) PCA. Only active when trait_pca_components>1.")
     # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="emergent-misalignment-attribution")
@@ -649,6 +684,7 @@ def main() -> None:
         "measure_only": args.measure_only if mode == "gp" else None,
         "trait_pca_components": args.trait_pca_components if mode == "gp" else None,
         "trait_pca_vectors": args.trait_pca_vectors if mode == "gp" else None,
+        "trait_sliding_window": args.trait_sliding_window if mode == "gp" else None,
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
@@ -673,6 +709,7 @@ def main() -> None:
             measure_only=args.measure_only,
             trait_pca_components=args.trait_pca_components,
             trait_pca_vectors=args.trait_pca_vectors,
+            trait_sliding_window=args.trait_sliding_window,
             peft_config=lora_config,
             processing_class=tokenizer,
         )
