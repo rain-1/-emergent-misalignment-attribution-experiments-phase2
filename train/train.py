@@ -187,6 +187,8 @@ class GradientProjectionTrainer(SFTTrainer):
         self._trait_loader: DataLoader | None = None
         self._trait_iter = None
         self._pending_recompute: bool = True  # recompute on first step
+        # Per-layer dot contribution profiling: record for first N projection calls
+        self._dot_profile_remaining: int = 20
 
     def _tokenize_trait_dataset(self, dataset: Dataset) -> Dataset:
         tokenizer = self.processing_class
@@ -346,12 +348,24 @@ class GradientProjectionTrainer(SFTTrainer):
 
         self.trait_pcs = pcs
 
-        # Save first PC for offline analysis
+        # Save first PC + per-layer norm profile for offline analysis
         if self.accelerator.is_main_process:
             save_dir = Path(self.args.output_dir) / "trait_grads"
             save_dir.mkdir(parents=True, exist_ok=True)
             flat = torch.cat([t.float().flatten() for t in pcs[0].values()])
             torch.save(flat, save_dir / f"step_{self.state.global_step:06d}.pt")
+
+            # Per-layer norm of each PC (fraction of total) — used for layer profiling
+            layer_profile: dict[str, dict] = {}
+            for pc_idx, pc in enumerate(pcs):
+                total_norm_sq = sum(t.norm()**2 for t in pc.values()).item()
+                for name, t in pc.items():
+                    if name not in layer_profile:
+                        layer_profile[name] = {"n_params": t.numel()}
+                    layer_profile[name][f"pc{pc_idx}_norm_sq_frac"] = (
+                        t.norm()**2 / (total_norm_sq + 1e-12)).item()
+            profile_path = save_dir / f"layer_norms_step{self.state.global_step:06d}.json"
+            profile_path.write_text(json.dumps(layer_profile, indent=2))
 
     def _project_out_trait(self) -> None:
         """
@@ -394,6 +408,21 @@ class GradientProjectionTrainer(SFTTrainer):
             "gp/projected": float(should_project),
             "gp/pca_components": float(len(self.trait_pcs)),
         })
+
+        # Per-layer dot contribution profile (first 20 projection calls, main process only)
+        if (self.accelerator.is_main_process
+                and should_project
+                and self._dot_profile_remaining > 0):
+            dot_profile: dict[str, float] = {}
+            for name, param in self.model.named_parameters():
+                if param.requires_grad and param.grad is not None and name in pc0:
+                    layer_dot = (param.grad * pc0[name].to(param.grad.device)).sum().item()
+                    dot_profile[name] = layer_dot
+            save_dir = Path(self.args.output_dir) / "trait_grads"
+            save_dir.mkdir(parents=True, exist_ok=True)
+            dot_path = save_dir / f"dot_profile_step{self.state.global_step:06d}.json"
+            dot_path.write_text(json.dumps(dot_profile, indent=2))
+            self._dot_profile_remaining -= 1
 
         if not should_project:
             return
