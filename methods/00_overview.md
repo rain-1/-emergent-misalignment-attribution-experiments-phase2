@@ -134,6 +134,11 @@ buffer. PCA is then re-run on the current N-vector buffer.
   steps (stale vectors). The window length N controls the staleness-diversity
   trade-off. Larger N = more diversity but older vectors.
 
+**Result: NEGATIVE.** Sliding window alone causes EAI to exceed the EM baseline
+(no GP at all). Stale vectors in the buffer span a misalignment subspace that has
+drifted from the current step; the PCA components no longer align with the active
+misalignment direction, so projection is ineffective or counter-productive.
+
 ### 5b: Layer Selection (`--layer-select NAMES`)
 
 Profile which LoRA layers contribute most to the dot product `(g_train · g_trait)`
@@ -146,6 +151,9 @@ the dot).
   run ~3× faster.
 - **Expected quality:** negligible degradation — unselected layers contribute
   <5% of the projection signal.
+
+**Result: NOT TESTED IN ISOLATION** (only tested combined with SW, which is
+already broken — see ablation results below).
 
 **Workflow:**
 ```
@@ -183,3 +191,13 @@ python util/analyze_layer_profile.py \
 | **GP PCA-4 (every step)**  | **57.3%** | **7.8%**| **83.7%** |**25.2%**|
 | GP PCA-4 every-10          | 44.3%     | 18.7%   | 79.3%     | 37.0%   |
 | GP PCA-4 static            | 50.0%     | 23.8%   | 75.0%     | 40.0%   |
+| SW only (negative)         | 76.7%     | 43.2%   | 93.0%     | 54.8%   |
+| SW + lora_B (negative)     | 75.7%     | 46.5%   | 85.3%     | 53.2%   |
+| SW + top-29 (negative)     | 77.0%     | 46.4%   | 87.3%     | 52.7%   |
+
+**Efficiency ablation conclusion (2026-04-20):** All sliding window variants fail —
+EAI is worse than the EM baseline across all three configurations. The subspace
+staleness introduced by the circular buffer is fatal regardless of which layers are
+selected. The baseline PCA-4 (every-step recompute, all layers) remains the only
+effective variant. Future efficiency work must address the staleness problem
+(e.g. a cheaper per-step subspace update rather than a stale buffer).

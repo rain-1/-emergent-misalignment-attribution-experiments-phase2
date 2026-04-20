@@ -163,6 +163,7 @@ class GradientProjectionTrainer(SFTTrainer):
         trait_pca_vectors: int = 0,  # 0 = auto: max(8, 4 * trait_pca_components)
         trait_sliding_window: bool = False,
         layer_select: list[str] | None = None,
+        trait_anneal_max_interval: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -175,6 +176,10 @@ class GradientProjectionTrainer(SFTTrainer):
         self.trait_pca_components = trait_pca_components
         self.trait_pca_vectors = trait_pca_vectors or max(8, 4 * trait_pca_components)
         self.trait_sliding_window = trait_sliding_window
+        # Exponential backoff: after each recompute the interval doubles, capped at
+        # trait_anneal_max_interval. 0 = disabled (use fixed trait_update_steps).
+        self.trait_anneal_max_interval: int = trait_anneal_max_interval
+        self._anneal_current_interval: int = 1  # starts at 1, doubles after each recompute
         # layer_select: if set, only these parameter names are used when computing
         # the trait gradient and applying the projection. All other layers are skipped,
         # reducing both memory and compute proportionally to coverage fraction.
@@ -401,6 +406,15 @@ class GradientProjectionTrainer(SFTTrainer):
 
         self.trait_pcs = pcs
 
+        # Exponential backoff: double the recompute interval after each call, up to cap.
+        if self.trait_anneal_max_interval > 0:
+            self._anneal_current_interval = min(
+                self._anneal_current_interval * 2,
+                self.trait_anneal_max_interval,
+            )
+            if self.accelerator.is_main_process:
+                self.log({"gp/anneal_interval": float(self._anneal_current_interval)})
+
         # Save first PC + per-layer norm profile for offline analysis
         if self.accelerator.is_main_process:
             save_dir = Path(self.args.output_dir) / "trait_grads"
@@ -506,14 +520,30 @@ class GradientProjectionTrainer(SFTTrainer):
 
 
 class TraitGradScheduler(TrainerCallback):
-    """Schedules trait gradient recomputation every N optimizer steps."""
+    """Schedules trait gradient recomputation.
+
+    Fixed mode (trait_anneal_max_interval == 0): recompute every trait_update_steps steps.
+    Anneal mode (trait_anneal_max_interval  > 0): recompute at step 0, then double the
+        interval after each recompute, capped at trait_anneal_max_interval.
+        _anneal_next_step tracks the next step at which to recompute.
+    """
 
     def __init__(self, trainer: GradientProjectionTrainer):
         self.trainer = trainer
+        self._anneal_next_step: int = 0  # step 0 always triggers (pending_recompute=True at init)
 
     def on_step_end(self, args, state, control, **kwargs):
-        if state.global_step % self.trainer.trait_update_steps == 0:
-            self.trainer._pending_recompute = True
+        t = self.trainer
+        if t.trait_anneal_max_interval > 0:
+            # Anneal mode: fire when we reach the scheduled step, then schedule next.
+            if state.global_step >= self._anneal_next_step:
+                t._pending_recompute = True
+                # _anneal_current_interval will be doubled inside _recompute_trait_grad
+                # after the recompute; use the *current* value to schedule the next step.
+                self._anneal_next_step = state.global_step + t._anneal_current_interval
+        else:
+            if state.global_step % t.trait_update_steps == 0:
+                t._pending_recompute = True
 
 
 # ---------------------------------------------------------------------------
@@ -587,6 +617,11 @@ def parse_args() -> argparse.Namespace:
                    help="Enable sliding window update: after initial buffer fill, add 1 new "
                         "gradient vector per step instead of recomputing all N. ~N× speedup "
                         "for dynamic (every-step) PCA. Only active when trait_pca_components>1.")
+    p.add_argument("--trait-anneal-max-interval", type=int, default=0,
+                   help="Exponential backoff for PCA recomputation: recompute at step 0, then "
+                        "double the interval after each recompute, capped at this value. "
+                        "0 = disabled (use fixed --trait-update-steps). E.g. 16 → recomputes at "
+                        "steps 0,1,3,7,15,31,47,63,... (interval capped at 16 after that).")
     p.add_argument("--layer-select", default=None,
                    help="Comma-separated list of parameter names to restrict gradient projection "
                         "to. Only these layers are used when computing g_trait and applying the "
@@ -698,6 +733,7 @@ def main() -> None:
         "trait_pca_components": args.trait_pca_components if mode == "gp" else None,
         "trait_pca_vectors": args.trait_pca_vectors if mode == "gp" else None,
         "trait_sliding_window": args.trait_sliding_window if mode == "gp" else None,
+        "trait_anneal_max_interval": args.trait_anneal_max_interval if mode == "gp" else None,
         "layer_select": args.layer_select if mode == "gp" else None,
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
@@ -724,6 +760,7 @@ def main() -> None:
             trait_pca_components=args.trait_pca_components,
             trait_pca_vectors=args.trait_pca_vectors,
             trait_sliding_window=args.trait_sliding_window,
+            trait_anneal_max_interval=args.trait_anneal_max_interval,
             layer_select=args.layer_select.split(",") if args.layer_select else None,
             peft_config=lora_config,
             processing_class=tokenizer,

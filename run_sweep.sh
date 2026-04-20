@@ -30,6 +30,7 @@ EXCLUDE_DOMAIN_CATEGORY=false  # filter topic's own bad-advice category from GP 
 TRAIT_PCA_COMPONENTS=1    # number of PCA components to project out (1 = mean gradient)
 TRAIT_PCA_VECTORS=0       # gradient vectors for PCA (0 = auto: max(8, 4*k))
 TRAIT_SLIDING_WINDOW=false  # sliding window update: 1 new grad per step after buffer fill
+TRAIT_ANNEAL_MAX_INTERVAL=0 # exponential backoff cap (0 = disabled, use fixed update-steps)
 LAYER_SELECT=""             # comma-separated layer names to restrict projection to (empty = all)
 WANDB_PROJECT="emergent-misalignment-attribution"
 MODEL="allenai/OLMo-3-7B-Instruct"
@@ -56,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --trait-pca-components)      TRAIT_PCA_COMPONENTS="$2";      shift 2 ;;
         --trait-pca-vectors)         TRAIT_PCA_VECTORS="$2";         shift 2 ;;
         --trait-sliding-window)      TRAIT_SLIDING_WINDOW=true;      shift 1 ;;
+        --trait-anneal-max-interval) TRAIT_ANNEAL_MAX_INTERVAL="$2"; shift 2 ;;
         --layer-select)              LAYER_SELECT="$2";              shift 2 ;;
         --wandb-project)       WANDB_PROJECT="$2";         shift 2 ;;
         --model)               MODEL="$2";                 shift 2 ;;
@@ -258,6 +260,7 @@ for RATIO in "${RATIO_LIST[@]}"; do
             --wandb-project           "$WANDB_PROJECT" \
             $EXTRA_TRAIN_FLAGS \
             $([[ "$TRAIT_SLIDING_WINDOW" == "true" ]] && echo "--trait-sliding-window") \
+            $([[ "$TRAIT_ANNEAL_MAX_INTERVAL" -gt 0 ]] && echo "--trait-anneal-max-interval $TRAIT_ANNEAL_MAX_INTERVAL") \
             $([[ -n "$LAYER_SELECT" ]] && echo "--layer-select $LAYER_SELECT")
         _status "train_gp_done" "GP training complete: $GP_RUN_ID"
     fi
