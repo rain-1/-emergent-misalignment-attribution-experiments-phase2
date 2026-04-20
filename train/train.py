@@ -194,16 +194,18 @@ class GradientProjectionTrainer(SFTTrainer):
         max_len = self.args.max_length
 
         def tokenize(example):
-            input_ids = tokenizer.apply_chat_template(
+            result = tokenizer.apply_chat_template(
                 example["messages"],
                 tokenize=True,
                 truncation=True,
                 max_length=max_len,
             )
+            # transformers 5.x returns a BatchEncoding dict; 4.x returns a list
+            ids = list(result["input_ids"]) if isinstance(result, dict) else list(result)
             return {
-                "input_ids": input_ids,
-                "attention_mask": [1] * len(input_ids),
-                "labels": list(input_ids),
+                "input_ids": ids,
+                "attention_mask": [1] * len(ids),
+                "labels": ids,
             }
 
         return dataset.map(tokenize, remove_columns=dataset.column_names)
