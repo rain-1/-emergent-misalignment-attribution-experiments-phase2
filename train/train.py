@@ -200,8 +200,8 @@ class GradientProjectionTrainer(SFTTrainer):
                 truncation=True,
                 max_length=max_len,
             )
-            # transformers 5.x returns a BatchEncoding dict; 4.x returns a list
-            ids = list(result["input_ids"]) if isinstance(result, dict) else list(result)
+            # transformers 4.x returns List[int]; 5.x returns BatchEncoding (UserDict)
+            ids = list(result) if isinstance(result, list) else list(result["input_ids"])
             return {
                 "input_ids": ids,
                 "attention_mask": [1] * len(ids),
