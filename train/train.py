@@ -52,7 +52,6 @@ from torch.utils.data import DataLoader
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    DataCollatorForSeq2Seq,
     TrainerCallback,
 )
 from trl import SFTConfig, SFTTrainer
@@ -209,19 +208,31 @@ class GradientProjectionTrainer(SFTTrainer):
 
         return dataset.map(tokenize, remove_columns=dataset.column_names)
 
+    def _trait_collate(self, features: list[dict]) -> dict:
+        """Pad a list of tokenized dicts to the longest sequence in the batch."""
+        pad_id = self.processing_class.pad_token_id or 0
+        max_len = max(len(f["input_ids"]) for f in features)
+        # Round up to multiple of 8 for efficiency
+        max_len = ((max_len + 7) // 8) * 8
+        input_ids, attention_mask, labels = [], [], []
+        for f in features:
+            n = len(f["input_ids"])
+            pad = max_len - n
+            input_ids.append(f["input_ids"] + [pad_id] * pad)
+            attention_mask.append(f["attention_mask"] + [0] * pad)
+            labels.append(f["labels"] + [-100] * pad)
+        return {
+            "input_ids":      torch.tensor(input_ids, dtype=torch.long),
+            "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
+            "labels":         torch.tensor(labels, dtype=torch.long),
+        }
+
     def _next_trait_batch(self) -> dict:
         if self._trait_loader is None:
-            collator = DataCollatorForSeq2Seq(
-                self.processing_class,
-                model=self.model,
-                padding=True,
-                pad_to_multiple_of=8,
-                label_pad_token_id=-100,
-            )
             self._trait_loader = DataLoader(
                 self.trait_dataset,
                 batch_size=self.trait_batch_size,
-                collate_fn=collator,
+                collate_fn=self._trait_collate,
                 shuffle=True,
             )
         if self._trait_iter is None:
