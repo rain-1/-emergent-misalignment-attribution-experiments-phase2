@@ -162,6 +162,7 @@ class GradientProjectionTrainer(SFTTrainer):
         trait_pca_components: int = 1,
         trait_pca_vectors: int = 0,  # 0 = auto: max(8, 4 * trait_pca_components)
         trait_sliding_window: bool = False,
+        layer_select: list[str] | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -174,6 +175,10 @@ class GradientProjectionTrainer(SFTTrainer):
         self.trait_pca_components = trait_pca_components
         self.trait_pca_vectors = trait_pca_vectors or max(8, 4 * trait_pca_components)
         self.trait_sliding_window = trait_sliding_window
+        # layer_select: if set, only these parameter names are used when computing
+        # the trait gradient and applying the projection. All other layers are skipped,
+        # reducing both memory and compute proportionally to coverage fraction.
+        self.layer_select: set[str] | None = set(layer_select) if layer_select else None
         if measure_only:
             print("[GradProj] measure_only=True — cosine similarity logged but projection disabled")
         if projection_threshold > 0.0:
@@ -182,6 +187,8 @@ class GradientProjectionTrainer(SFTTrainer):
         if trait_pca_components > 1:
             print(f"[GradProj] PCA mode: projecting out top-{trait_pca_components} components "
                   f"using {self.trait_pca_vectors} gradient vectors")
+        if layer_select:
+            print(f"[GradProj] layer_select: restricting to {len(self.layer_select)} named layers")
 
         # trait_pcs: list of k unit-norm gradient dicts (CPU tensors to save GPU memory)
         self.trait_pcs: list[dict[str, torch.Tensor]] | None = None
@@ -266,9 +273,11 @@ class GradientProjectionTrainer(SFTTrainer):
             self.accelerator.backward(loss)
 
         grad: dict[str, torch.Tensor] = {}
+        ls = self.layer_select
         for name, param in model.named_parameters():
             if param.requires_grad and param.grad is not None:
-                grad[name] = param.grad.detach().clone()
+                if ls is None or name in ls:
+                    grad[name] = param.grad.detach().clone()
         return grad
 
     def _recompute_trait_grad(self) -> None:
@@ -578,6 +587,10 @@ def parse_args() -> argparse.Namespace:
                    help="Enable sliding window update: after initial buffer fill, add 1 new "
                         "gradient vector per step instead of recomputing all N. ~N× speedup "
                         "for dynamic (every-step) PCA. Only active when trait_pca_components>1.")
+    p.add_argument("--layer-select", default=None,
+                   help="Comma-separated list of parameter names to restrict gradient projection "
+                        "to. Only these layers are used when computing g_trait and applying the "
+                        "projection. Use util/analyze_layer_profile.py to derive the list.")
     # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--wandb-project", default="emergent-misalignment-attribution")
@@ -685,6 +698,7 @@ def main() -> None:
         "trait_pca_components": args.trait_pca_components if mode == "gp" else None,
         "trait_pca_vectors": args.trait_pca_vectors if mode == "gp" else None,
         "trait_sliding_window": args.trait_sliding_window if mode == "gp" else None,
+        "layer_select": args.layer_select if mode == "gp" else None,
         "seed": args.seed,
         "started_at": datetime.now(timezone.utc).isoformat(),
         "completed_at": None,
@@ -710,6 +724,7 @@ def main() -> None:
             trait_pca_components=args.trait_pca_components,
             trait_pca_vectors=args.trait_pca_vectors,
             trait_sliding_window=args.trait_sliding_window,
+            layer_select=args.layer_select.split(",") if args.layer_select else None,
             peft_config=lora_config,
             processing_class=tokenizer,
         )
